@@ -1,0 +1,191 @@
+# TODO AG allLayers ersetzen
+# TODO AG include reduced_losses
+import os
+import itertools
+import tensorflow as tf
+import numpy      as np
+from collections  import defaultdict
+from importlib    import import_module
+from utils        import log
+from model        import Model
+from layer        import Layer
+
+class Stacked_GMM(Model):
+
+  def __init__(self, **kwargs):
+    super(Stacked_GMM, self).__init__(**kwargs)
+
+    # TODO AG andere params wieder rein: sampling_batches, sampling True/false etc.
+    #-------------------------------------------------------- SAMPLING PARAMETER
+    self.sampling_batch_size      = self.parser.add_argument('--sampling_batch_size'     , type=int  , default=100  , help='size of mini-batches used for sampling (preferably the same as batch size)')
+    self.sampling_divisor         = self.parser.add_argument('--sampling_divisor'        , type=float, default=1.   , help='divide stddevs in sampling by this factor')
+
+
+  def build(self):
+    log.info('build Stacked GMM Model')
+    input_       = None
+    # TODO problematisch wenn layer woanders ist
+    layers_path  = os.path.join(os.path.dirname(__file__), '..', 'layer')
+    valid_layers = [ layer[:-3] for layer in os.listdir(f'{layers_path}/') if not (layer.startswith('__') or layer in ['layer.py', 'regularizer']) ]
+
+    # TODO hier add benutzen?
+    # TODO InputLayer extra instanziieren
+    inputL
+    for i in itertools.count(start=1):      
+      # start layer loop
+      layer_type = self.parser.get_all_parameters().get(f'L{i}');
+      if layer_type is None: break # get layer type or stop if no more defined
+      if layer_type not in valid_layers: raise Exception(f'{layer_type} not in {valid_layers}')
+      try                              : input_ = getattr(import_module(f'layer.{layer_type}'), layer_type)(input_=input_, **vars(self)) # instantiate given layer class object from "layer" package
+      except Exception as ex           : raise ex
+
+    self.layers  = Layer.all_layer # "copy" list of all layers from Layer class
+
+    ''' Ensure model architecture constraints and consistency (layer placement).
+        Setup some indices for easier access to returning losses and variable dictionaries.
+        Initializes checkpoint manager since this can only be done after all layers are added.
+    '''
+    # Init structures for all forward passes, calculated outputs and losses
+    # TODO reduced_loss rein!
+    self.forwards        = [0] * len(self.layers)
+    self.eval            = [0] * len(self.layers)
+    self.outputs         = [0] * len(self.layers)
+    self.losses          = [0] * len(self.layers)
+    self.variables       = [0] * len(self.layers)
+    self.gradients       = [0] * len(self.layers)
+    self.extloss_indices = []
+    self.gmm_gradients   = []
+
+    for layer in self.layers:
+      if layer.is_layer_type('Linear_Classifier_Layer'):
+        self.extloss_indices += [layer.layer_id]
+      if layer.is_layer_type('GMM_Layer'):
+        self.extloss_indices += [layer.layer_id]
+        self.gmm_gradients   += [layer.layer_id]
+    if len(self.gmm_gradients) > 1:
+      self.stacked = True
+
+
+  def get_model_variables_load_store(self, **kwargs):
+    ''' collect all model variables to load or create a checkpoint '''
+    model_vars = dict()
+    for layer in self.layers: # collect all variables form layers
+      model_vars.update(layer.get_layer_variables(all=True))
+    return model_vars
+
+
+  def train_step(self, xs, ys=None, **kwargs):
+    with tf.GradientTape(persistent=True) as g:
+      self.forward(xs=xs)
+      self.loss(xs, ys)
+    for layer, loss, variables in zip(self.layers, self.losses, self.variables):
+      if layer.is_trainable():
+        self.gradients[layer.layer_id - 1] = g.gradient(loss, variables)
+    del g # free memory here
+
+    for layer, gradients in zip(self.layers, self.gradients):
+      layer.update_with_grad(gradients)
+
+
+  def test(self, test_iterator, **kwargs):
+    ''' test the model with the given test iterator
+    @param test_iterator: TF2 test iterator
+    @return: dict(tuple(source <str>, metric <str>: tuple(metric_value_raw <float>, formatted metric value <str>)))
+    '''
+    results = defaultdict(list)
+    for xs, ys in test_iterator:
+      test_results = self.test_step(xs, ys)
+      for layer_name, metric_and_values in test_results.items():
+        for metric_name, metric_value in metric_and_values.items():
+          results[(layer_name, metric_name)] += [metric_value]
+
+    return_results = dict()
+    for (layer_name, metric_name), metric_values in results.items():
+      if 'accuracy' in metric_name: format_str = '{:10.1%}'
+      else                        : format_str = '{:10.2f}'
+      metric_values                             = np.mean(metric_values)
+      return_results[(layer_name, metric_name)] = (metric_values, format_str.format(metric_values))
+    return return_results
+
+
+  def evaluate(self, xs, ys, **kwargs):
+    self.forward(xs=xs)
+    self.loss(xs, ys)
+    for index, layer in enumerate(self.layers[1:], start=1):
+      self.eval[index] = layer.evaluate(self.forwards[index], ys=ys)
+    return self.eval
+
+
+  def test_step(self, xs, ys=None, **kwargs):
+    self.evaluate(xs, ys)
+    collect_results = dict()
+    return_results  = dict()
+    for layer, loss, more_eval_values in zip(self.layers, self.losses, self.eval):
+      if not isinstance(more_eval_values, dict): more_eval_values = {}
+      collect_results[layer.get_name()] = dict(loss=loss, **more_eval_values)
+
+      layer_metrics = layer.post_test_step(        # compute layer test steps
+        results = collect_results.get(layer.get_name()), # output of testing, e.g. log-likelihood, accuracy, outliers
+        xs      = xs                           , # the batches used for evaluation as list
+        ys      = ys                           ,
+      )
+
+      if layer_metrics: return_results[layer.get_name()] = layer_metrics
+
+    return return_results
+
+
+  def reset(self, **kwargs):
+    ''' call the reset function of each layer, e.g., reset somSigma to initial value (if smaller 0, no reset is performed) '''
+    reset_factor = kwargs.get('reset_factor', 1.0)
+
+    log.info(f'reset layers with reset factor: {reset_factor}')
+    for layer in self.layers:
+      layer.reset_layer(reset_factor=reset_factor)
+
+
+  def forward(self, **kwargs):
+    input_ = kwargs.get('xs')
+    for index, layer in enumerate(self.layers[1:], start=1):
+      self.forwards[index]  = layer.forward(input_)
+      self.outputs[index]   = layer.get_output(self.forwards[index]) # Folded output is here
+      self.variables[index] = layer.get_layer_variables()            # pis, sigmas, mus
+      input_                = self.outputs[index]                    # This is used by the next layer for training (e.g. fold -> GMM)
+    return self.forwards[-1]
+
+
+  def loss(self, xs, ys):
+    for index, layer in enumerate(self.layers[1:], start=1):
+      self.losses[index] = layer.loss(self.forwards[index], ys=ys) # GMM returning loss
+    return self.losses
+
+
+  def sample_one_batch(self, topdown=None):
+    ''' sample one batch '''
+    last_layer = self.layers[-1]
+    sampled    = last_layer.backwards(topdown)
+    for layer in reversed(self.layers[1:-1]):
+      sampled = layer.backwards(sampled)
+      log.debug(f'Sampling from: {layer.name} topdown to lower {sampled.shape}: max={sampled.numpy().max()}')
+
+      if layer.is_layer_type('Folding_Layer'):
+        sampled = self.do_sharpening(layer, sampled, topdown)
+    return sampled
+
+
+  def do_sharpening(self, layer, X, Y):
+    ''' sharpening is now an architecture-level functionality '''
+    if not layer.is_layer_type('Folding_Layer'): return
+    varX = tf.Variable(X)
+    for _ in range(layer.sharpening_iterations):
+      with tf.GradientTape() as g:
+        forward_ = layer.forward(varX)
+        forward_ = layer.next.forward(forward_)
+        loss     = tf.reduce_mean(layer.next.loss(forward_))
+
+      grad = g.gradient(loss, varX, unconnected_gradients='zero')
+      varX.assign(varX + layer.sharpening_rate * grad)
+    return varX
+
+
+

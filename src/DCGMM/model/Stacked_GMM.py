@@ -1,0 +1,417 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+import os
+import itertools
+import tensorflow as tf
+import numpy      as np
+from collections  import defaultdict
+from importlib    import import_module
+from DCGMM.utils  import log, change_loglevel
+from .            import Model
+from DCGMM.layer  import Input_Layer
+
+class Stacked_GMM(Model):
+
+  def __init__(self, **kwargs):
+    super(Stacked_GMM, self).__init__(verbose=True, **kwargs)
+    self.kwargs = kwargs
+
+    #-------------------------------------------------------- SAMPLING PARAMETER
+    self.results_dir              = self.parser.add_argument('--results_dir'             , type=str  , default='./results'  , help='set the default directory to put logs etc..')
+    self.sampling_batch_size      = self.parser.add_argument('--sampling_batch_size'     , type=int  , default=100  , help='size of mini-batches used for sampling (preferably the same as batch size)')
+    self.sampling_divisor         = self.parser.add_argument('--sampling_divisor'        , type=float, default=1.   , help='divide stddevs in sampling by this factor')
+    self.sampling                 = self.parser.add_argument('--sampling'                , type=eval , default=False, help='???')
+    self.sampling_layer           = self.parser.add_argument('--sampling_layer'          , type=int , default=-1, help='layer to sample from')
+    self.no_avg_metrics           = self.parser.add_argument('--no_avg_metrics'          , type=str, default=[], help='which metrix should not be avged but concatened?')
+    self.log_level                = self.parser.add_argument('--log_level'               , type=str, default='DEBUG', choices=['DEBUG','INFO'], help='which metrix should not be avged but concatened?')
+    print (self.no_avg_metrics, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    change_loglevel(self.log_level)
+    print(vars(self))
+
+    self.h                        = self.parser.add_argument('--h'                        , type=int , default=28                                , help='' )
+    self.w                        = self.parser.add_argument('--w'                        , type=int , default=28                                , help='' )
+    self.c                        = self.parser.add_argument('--c'                        , type=int , default=1                                 , help='' )
+
+    self.percentage_task_done     = 1.0
+
+    self.layers                   = list()
+
+    self.global_loss              = None
+
+
+  def compile(self, **kwargs):
+    ''' connect all independantly added layers (only used for external models) '''
+    previous = None
+    for layer_id, layer in enumerate(self.layers):
+      if layer_id != 0: layer.prev = previous
+      previous   = layer
+      layer.compile()
+    self._init_structures()
+
+  def __str__(self):
+    return str(self.kwargs) 
+
+
+  def build(self, **kwargs):
+    log.info('build Stacked GMM Model')
+    input_       = Input_Layer(input_=None, batch_size=self.batch_size, h=self.h, w=self.w, c=self.c) # TODO: Was ist wenn jemand die Klasse ueberschreiben will?
+    self.add(input_)
+
+    layers_path  = os.path.join(os.path.dirname(__file__), '..', 'layer') # TODO: external use
+    valid_layers = [ layer[:-3] for layer in os.listdir(f'{layers_path}/') if not (layer.startswith('__') or layer in ['layer.py', 'regularizer']) ]
+
+    for i in itertools.count(start=1): # instantiate and link DCGMM layers
+      layer_type      = self.parser.get_all_parameters().get(f'L{i}', None)
+      input_layer_idx = int(self.parser.get_all_parameters().get(f'L{i}_input', i-1))
+      input_layer     = self.layers[input_layer_idx]
+
+      if layer_type is None            : break # get layer type or stop if no more defined
+      if layer_type not in valid_layers: raise Exception(f'{layer_type} not in {valid_layers}')
+      try                              : input_ = getattr(import_module(f'DCGMM.layer.{layer_type}'), layer_type)(input=input_layer, **self.kwargs) # instantiate given layer class object from "layer" package
+      except Exception as ex           : raise ex
+      input_.layer_id = i   # TODO check how tht works out for manually created DCGMMs
+      self.add(input_)
+
+    for layer in self.layers:
+      layer.compile()
+
+    self._init_structures()
+
+
+  def _init_structures(self):
+    # Init structures for all forward passes, calculated outputs and losses
+    self.forwards        = [0] * len(self.layers)
+    self.eval            = [0] * len(self.layers)
+    self.outputs         = [0] * len(self.layers)
+    self.losses          = [0] * len(self.layers)
+    self.raw_losses      = [0] * len(self.layers)
+    self.variables       = [0] * len(self.layers)
+    self.gradients       = [0] * len(self.layers)
+
+    for index, layer in enumerate(self.layers[1:], start=1):
+      self.variables[index] = layer.get_layer_variables()
+
+
+  def get_model_variables_store_load(self, **kwargs):
+    ''' collect all model variables to load or create a checkpoint '''
+    model_vars = dict()
+    for layer in self.layers: # collect all variables form layers
+      model_vars.update(layer.get_layer_variables(all_=True))
+    return model_vars
+
+
+  def set_parameters(self, **kwargs):
+    self.percentage_task_done = kwargs.get('percentage_task_done', 1.0)
+
+
+  # TODO check and adapt to new graph-based approach
+  def train_step_mask(self, xs, ys, mask_alpha=None, **kwargs):
+    """ only train gmms on  incorrectly classified samples from input mini-batch """
+    self.forward(xs=xs)
+    if self.layers[-1].is_layer_type('Linear_Classifier_Layer'):
+      eval_res = self.layers[-1].evaluate(self.forwards[-1], ys=ys)
+      label_acc = tf.equal(eval_res["y_true"], eval_res["y_pred"])
+    with tf.GradientTape(persistent=True) as g:
+      self.forward(xs=xs)
+      if self.layers[-1].is_layer_type('Linear_Classifier_Layer'): self.masked_loss(xs, label_acc, ys, mask_alpha)
+      else: self.loss(xs, ys=None)
+
+    for layer, loss, variables in zip(self.layers, self.losses, self.variables):
+      if layer.is_trainable():
+        self.gradients[layer.layer_id] = g.gradient(loss, variables)
+
+    del g
+
+    for layer, gradients in zip(self.layers, self.gradients):
+      if layer.is_trainable():
+        layer.set_parameters(percentage_task_done = self.percentage_task_done)
+        layer.update_with_grad(gradients)
+
+
+  def train_step_bound(self, sigbound, xs, ys=None, **kwargs):
+    """ only train lin classifier if all gmm layers have converged (sigma boundary reached) """
+    with tf.GradientTape(persistent=True) as g:
+      self.forward(xs=xs)
+      self.loss(xs, ys)
+
+    train_active = True; gmm_converged = {}
+    for layer in self.layers:
+      if layer.is_trainable():
+        if layer.is_layer_type('Linear_Classifier_Layer'):
+          for layer_ in self.layers:
+            if layer_.is_layer_type('GMM_Layer'):  # check all sigmas
+              if layer_.tfSomSigma.numpy() <= float(sigbound):
+                gmm_converged[layer_.prefix] = True
+              else:
+                gmm_converged[layer_.prefix] = False
+          for k, v in gmm_converged.items():
+            if v.__eq__(False): train_active = False
+          if train_active:  # only train lin. class if sigma training activated
+            self.gradients[layer.layer_id] = g.gradient(self.global_loss,
+                                                        self.variables[layer.layer_id],
+                                                        unconnected_gradients='zero')
+        else: # gmm layers are trained regardless
+          self.gradients[layer.layer_id] = g.gradient(self.global_loss,
+                                                      self.variables[layer.layer_id],
+                                                      unconnected_gradients='zero')
+    del g
+
+    for layer, grads in zip(self.layers, self.gradients):
+      if layer.is_trainable():
+        if layer.is_layer_type('Linear_Classifier_Layer'):
+          if train_active:
+            # check all sigmas -> only permit updating with grads if sig threshold is hit
+            layer.set_parameters(percentage_task_done=self.percentage_task_done)
+            layer.update_with_grad(grads)
+        else:
+          # check all sigmas -> only permit updating with grads if sig threshold is hit
+          layer.set_parameters(percentage_task_done=self.percentage_task_done)
+          layer.update_with_grad(grads)
+
+
+  def train_step_glob(self, xs, ys=None, **kwargs):
+    """ train the StackedGMM model with a global loss e.g. the sum of each layer's loss (these are scaled with a alpha factor) """
+    with tf.GradientTape(persistent=True) as g:
+      self.forward(xs=xs)
+      self.loss(xs, ys)
+      self.global_loss = 0.  # accumulate layer' returning losses
+      for ret_loss in self.losses:
+        if tf.is_tensor(ret_loss) and ret_loss.dtype == self.dtype_tf_float:
+          self.global_loss += ret_loss
+
+    for layer, variables in zip(self.layers, self.variables):
+      if layer.is_trainable():
+        self.gradients[layer.layer_id] = g.gradient(self.global_loss,
+                                                    self.variables[layer.layer_id],
+                                                    unconnected_gradients='zero')
+
+    del g
+
+    for layer, grads in zip(self.layers, self.gradients):
+      if layer.is_trainable():
+        layer.set_parameters(percentage_task_done=self.percentage_task_done)
+        layer.update_with_grad(grads)
+
+
+  def train_step(self, xs, ys=None, mask = None, **kwargs):
+    '''
+    New train step that is much more memory-friendly.
+    Reason: we rely on Layer.do_all, which does 
+      - forward, output computation
+      - loss calculation
+      - gradient computation
+      - gradient application
+    all in one go, and INN GRAPH MODE. This is not really faster, 
+    but graph mode does save a ton of memory. Verified.
+    Of course if we want to do forward only,  we can still use forward()
+    '''
+    for index, (layer,variables) in enumerate(zip(self.layers[1:], self.variables[1:]), start=1):
+      input_layer_index    = layer.prev.layer_id 
+      input_tensor         = self.outputs[input_layer_index] if input_layer_index > 0 else xs
+      if mask == None:
+        mask_shape = [input_tensor.shape[0], 1, 1]
+        mask = tf.ones(mask_shape, dtype=self.dtype_tf_float) ;
+
+      #log.debug(f"Doing layer {index}") ;
+      # TODO stop_gradient necessary?? I think not. But does not hurt either.
+      layer.set_parameters(percentage_task_done = self.percentage_task_done)
+      self.forwards[index], self.outputs[index], self.raw_losses[index], self.losses[index] = layer.do_all(tf.stop_gradient(input_tensor), mask, ys=ys) ;
+
+
+  def test(self, test_iterator, **kwargs):
+    ''' test the model with the given test iterator.
+    @param test_iterator: TF2 test iterator
+    @return: dict(tuple(source <str>, metric <str>: tuple(metric_value_raw <float>, formatted metric value <str>)))
+    '''
+    results = defaultdict(list)
+    for xs, ys in test_iterator:
+      test_results = self.test_step(xs, ys)
+      #print (test_results)
+      #print(tf.reduce_min(xs), tf.reduce_max(xs));
+      for layer_name, metric_and_values in test_results.items():
+        for metric_name, metric_value in metric_and_values.items():
+          results[(layer_name, metric_name)] += [metric_value]
+
+    return_results = dict()
+    for (layer_name, metric_name), metric_values in results.items():
+      format_str = None 
+      if 'accuracy' in metric_name: format_str = '{:10.1%}'
+      else                        : format_str = '{:10.2f}'
+      final_metric = None
+      if  metric_name in self.no_avg_metrics:
+        final_metric = [float(x) for x in np.concatenate(metric_values)]
+        format_str = "...(too long)..." 
+      else:
+        final_metric                             = np.mean(metric_values)     
+      return_results[(layer_name, metric_name)] = (final_metric, format_str.format(final_metric))
+
+    self.vars_2_numpy(prefix = self.results_dir)
+    return return_results
+
+
+
+  def evaluate(self, xs, ys, **kwargs):
+    ''' in self.eval[x] we have {metric:tensor, ... } '''
+    self.forward(xs=xs)
+    self.loss(xs, ys, **kwargs)
+    for index, layer in enumerate(self.layers[1:], start=1):
+      self.eval[index] = layer.evaluate(self.forwards[index], ys=ys)
+    return self.eval
+
+
+  
+  def test_step(self, xs, ys=None, **kwargs):
+    ''' returns dict of {layer_name:{mtric_name:val, ...}, ...} '''
+    self.evaluate(xs, ys, **kwargs)
+    collect_results = dict()
+    return_results  = dict()
+    for layer, loss, more_eval_values in zip(self.layers, self.losses, self.eval):
+      if not isinstance(more_eval_values, dict): more_eval_values = { }
+      collect_results[layer.get_name()] = dict(loss=loss, **more_eval_values)
+
+      layer_metrics = layer.post_test_step(              # compute layer test steps
+        results = collect_results.get(layer.get_name()), # output of testing, e.g. log-likelihood, accuracy, outliers
+        xs      = xs                                   , # the batches used for evaluation as list
+        ys      = ys                                   ,
+      )
+      if layer_metrics: return_results[layer.get_name()] = layer_metrics
+
+    return return_results
+
+
+  def reset(self, **kwargs):
+    ''' call the reset function of each layer, e.g., reset somSigma to initial value (if smaller 0, no reset is performed) '''
+    reset_factor = kwargs.get('reset_factor', 1.0)
+
+    log.info(f'reset layers with reset factor: {reset_factor}')
+    for layer in self.layers:
+      layer.reset_layer(reset_factor=reset_factor)
+
+
+
+  def forward(self, **kwargs):
+    xs = kwargs.get('xs')
+    for index, layer in enumerate(self.layers[1:], start=1):
+      input_layer_index    = layer.prev.layer_id 
+      input_tensor         = self.outputs[input_layer_index] if input_layer_index > 0 else xs
+      self.forwards[index] = layer.forward(tf.stop_gradient(input_tensor))
+      self.outputs[index]  = layer.get_output(self.forwards[index]) # Folded output is here
+    return self.forwards[-1]
+
+
+  def loss(self, xs, ys, **kwargs):
+    for index, layer in enumerate(self.layers[1:], start=1):
+      self.raw_losses[index] = layer.loss(self.forwards[index], ys=tf.stop_gradient(ys))
+      self.losses[index]     = tf.reduce_mean(self.raw_losses[index])
+    return self.losses
+
+
+  def sample_one_batch(self, topdown=None, last_layer_index = -1):
+    ''' sample one batch '''
+    print (last_layer_index, len(self.layers))
+    if last_layer_index == -1: last_layer_index = len(self.layers) - 1
+    last_layer = self.layers[last_layer_index]
+    sampled    = last_layer.backwards(topdown)
+    layer_index = last_layer_index-1
+    for layer in reversed(self.layers[1:last_layer_index]):
+      sampled = layer.backwards(sampled)
+      log.debug(f'Sampling from: {layer.name} topdown to lower {sampled.shape}: max={sampled.numpy().max()}')
+      sampled = self.do_sharpening(layer, sampled)
+      layer_index -= 1
+
+    return sampled
+
+  def do_variant_generation(self, xs, bu_limit_layer = 0, **kwargs):    
+    self.forward(xs=xs, **kwargs)  
+    selection_layer_index = bu_limit_layer
+    last_layer_output = self.outputs[selection_layer_index]
+
+    # we implicitly assume that selection layer is GMM!!
+    return self.sample_one_batch(topdown=last_layer_output, last_layer_index = selection_layer_index)
+
+
+  def do_sharpening(self, layer, X):
+    ''' for each folding_layer: perform gradient ascent using the initial sampling result of that layer as starting point
+        GA modifies this starting point so as to optimize the loss of an upstream target GMM layer.
+        Usually, the target GMM layer should not be the following GMM layer but the one after that     
+    '''
+    target_layer = layer.get_target_layer()  # safe, since this method comes from Layer and return -1 for non-F layers. Folding_Layer returns the target_layer param here
+    if target_layer < 0: return X ;
+    varX = tf.Variable(X)
+    sharpening_rate = layer.get_sharpening_rate()
+    sharpening_iterations = layer.get_sharpening_iterations()
+    rec_weight = layer.get_reconstruction_weight()
+
+    for i in range(sharpening_iterations):
+      with tf.GradientTape() as g:
+        forward_ = layer.forward(varX)
+        output_ = layer.get_output(forward_)
+        
+        layer_ =  None
+        for layer_id in range(layer.layer_id + 1, target_layer+1):
+          layer_ = self.layers[layer_id]
+          forward_ = layer_.forward(output_)
+          output_ = layer_.get_output(forward_)
+        loss     = tf.reduce_mean(self.layers[target_layer].loss(forward_)) -    rec_weight * tf.reduce_mean((varX-X)**2) # TODO WTF?? why / ??
+
+      grad = g.gradient(loss, varX, unconnected_gradients='zero')
+      print(f"It={i}m loss={loss}")
+      varX.assign(varX + sharpening_rate * grad)
+    return varX
+
+
+  def construct_topdown_for_classifier(self, num_classes, maxconf, classes):
+    ''' create control signal from desired class output, with maxconf at the placeof the desired class.
+        classes contains a list of classes to be generated:[1,4,6] '''
+    batch_size = self.sampling_batch_size 
+    minconf = (1.-maxconf) / (num_classes - 1) 
+    T = np.ones([batch_size, num_classes],dtype=self.dtype_np_float) * minconf
+    one_hot = np.zeros([batch_size, num_classes],dtype=self.dtype_np_float) ;
+    ax1 = range(0,batch_size) 
+    drawnClassSamples = np.random.choice(classes, size=batch_size) ;
+    print (maxconf, minconf, drawnClassSamples)
+    T[ax1,drawnClassSamples] = maxconf 
+    one_hot[ax1,drawnClassSamples] = 1.0 ;
+    logT = tf.math.log(T) ;
+    #logT -= tf.reduce_min(logT, axis=1,keepdims=True) ; # 0 is smallest value
+    return tf.constant(logT), tf.constant(one_hot) ; 
+    
+
+  def vars_2_numpy(self, prefix="."):
+    # TODO: stop creating numpy files on all hosts, create a parameter or something
+    for layer in self.layers:
+      v = layer.get_layer_variables()
+      for k, v in v.items():
+        np.save((prefix+"/"+k + '.npy'), v.numpy())
+
+
+  def samples_2_numpy(self, sampled, prefix, mode="prototypes"):
+    ''' computes the DCGMM loss for the generated samples and saves them as pi's for visualization '''
+    N    = sampled.shape[0]
+    d    = np.prod(sampled.shape[1:])
+    if mode=='prototypes':
+      sh = (1, 1, 1, N, d) ; 
+    else:
+      sh = (N, d) ; 
+
+    loss =  np.zeros([1, 1, 1,N])
+    np.save(f'./{prefix}mus.npy', sampled.numpy().reshape(*sh))
+    np.save(f'./{prefix}pis.npy', loss )
+    np.save(f'./{prefix}sigmas.npy', np.zeros(sh))
+
+  def add(self, layer):
+    ''' adds a layer on top of the current model '''
+    self.layers.append(layer)
+    return self
+
+
