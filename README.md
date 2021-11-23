@@ -1,3 +1,3 @@
-Anonymous ICLR submission: DCGMM code
+Anonymous CVPR submission: DCGMM code
 
 
